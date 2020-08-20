@@ -33,7 +33,7 @@ import signal
 from sqlite3 import OperationalError
 
 from beets import ui
-from beets.plugins import BeetsPlugin
+from beets.plugins import BeetsPlugin, ParallelPlugin
 from beets.util import (syspath, command_output, bytestring_path,
                         displayable_path, py3_path, cpu_count)
 
@@ -1179,39 +1179,13 @@ class AudioToolsBackend(Backend):
             track_gains=track_gains
         )
 
-
-class ExceptionWatcher(Thread):
-    """Monitors a queue for exceptions asynchronously.
-        Once an exception occurs, raise it and execute a callback.
-    """
-
-    def __init__(self, queue, callback):
-        self._queue = queue
-        self._callback = callback
-        self._stopevent = Event()
-        Thread.__init__(self)
-
-    def run(self):
-        while not self._stopevent.is_set():
-            try:
-                exc = self._queue.get_nowait()
-                self._callback()
-                six.reraise(exc[0], exc[1], exc[2])
-            except queue.Empty:
-                # No exceptions yet, loop back to check
-                #  whether `_stopevent` is set
-                pass
-
-    def join(self, timeout=None):
-        self._stopevent.set()
-        Thread.join(self, timeout)
-
-
 # Main plugin logic.
 
-class ReplayGainPlugin(BeetsPlugin):
+class ReplayGainPlugin(ParallelPlugin, BeetsPlugin):
     """Provides ReplayGain analysis.
     """
+
+    nonfatal = [ReplayGainError]
 
     backends = {
         "command": CommandBackend,
@@ -1234,7 +1208,6 @@ class ReplayGainPlugin(BeetsPlugin):
             'overwrite': False,
             'auto': True,
             'backend': u'command',
-            'threads': cpu_count(),
             'per_disc': False,
             'peak': 'true',
             'targetlevel': 89,
@@ -1269,8 +1242,7 @@ class ReplayGainPlugin(BeetsPlugin):
 
         # On-import analysis.
         if self.config['auto']:
-            self.register_listener('import_begin', self.import_begin)
-            self.register_listener('import', self.import_end)
+            self.parallel_on_import()
             self.import_stages = [self.imported]
 
         # Formats to use R128.
@@ -1418,7 +1390,7 @@ class ReplayGainPlugin(BeetsPlugin):
                     self._log.debug(u'done analyzing {0}', item)
 
             try:
-                self._apply(
+                self.parallel_apply(
                     self.backend_instance.compute_album_gain, args=(),
                     kwds={
                         "items": [i for i in items],
@@ -1463,7 +1435,7 @@ class ReplayGainPlugin(BeetsPlugin):
             self._log.debug(u'done analyzing {0}', item)
 
         try:
-            self._apply(
+            self.parallel_apply(
                 self.backend_instance.compute_track_gain, args=(),
                 kwds={
                     "items": [item],
@@ -1477,89 +1449,6 @@ class ReplayGainPlugin(BeetsPlugin):
         except FatalReplayGainError as e:
             raise ui.UserError(u"Fatal replay gain error: {0}".format(e))
 
-    def _has_pool(self):
-        """Check whether a `ThreadPool` is running instance in `self.pool`
-        """
-        if hasattr(self, 'pool'):
-            if isinstance(self.pool, ThreadPool) and self.pool._state == RUN:
-                return True
-        return False
-
-    def open_pool(self, threads):
-        """Open a `ThreadPool` instance in `self.pool`
-        """
-        if not self._has_pool() and self.backend_instance.do_parallel:
-            self.pool = ThreadPool(threads)
-            self.exc_queue = queue.Queue()
-
-            signal.signal(signal.SIGINT, self._interrupt)
-
-            self.exc_watcher = ExceptionWatcher(
-                self.exc_queue,      # threads push exceptions here
-                self.terminate_pool  # abort once an exception occurs
-            )
-            self.exc_watcher.start()
-
-    def _apply(self, func, args, kwds, callback):
-        if self._has_pool():
-            def catch_exc(func, exc_queue, log):
-                """Wrapper to catch raised exceptions in threads
-                """
-                def wfunc(*args, **kwargs):
-                    try:
-                        return func(*args, **kwargs)
-                    except ReplayGainError as e:
-                        log.info(e.args[0])  # log non-fatal exceptions
-                    except Exception:
-                        exc_queue.put(sys.exc_info())
-                return wfunc
-
-            # Wrap function and callback to catch exceptions
-            func = catch_exc(func, self.exc_queue, self._log)
-            callback = catch_exc(callback, self.exc_queue, self._log)
-
-            self.pool.apply_async(func, args, kwds, callback)
-        else:
-            callback(func(*args, **kwds))
-
-    def terminate_pool(self):
-        """Terminate the `ThreadPool` instance in `self.pool`
-            (e.g. stop execution in case of exception)
-        """
-        # Don't call self._as_pool() here,
-        # self.pool._state may not be == RUN
-        if hasattr(self, 'pool') and isinstance(self.pool, ThreadPool):
-            self.pool.terminate()
-            self.pool.join()
-            # self.exc_watcher.join()
-
-    def _interrupt(self, signal, frame):
-        try:
-            self._log.info('interrupted')
-            self.terminate_pool()
-            exit(0)
-        except SystemExit:
-            # Silence raised SystemExit ~ exit(0)
-            pass
-
-    def close_pool(self):
-        """Close the `ThreadPool` instance in `self.pool` (if there is one)
-        """
-        if self._has_pool():
-            self.pool.close()
-            self.pool.join()
-            self.exc_watcher.join()
-
-    def import_begin(self, session):
-        """Handle `import_begin` event -> open pool
-        """
-        self.open_pool(self.config['threads'].get(int))
-
-    def import_end(self, paths):
-        """Handle `import` event -> close pool
-        """
-        self.close_pool()
-
     def imported(self, session, task):
         """Add replay gain info to items or albums of ``task``.
         """
@@ -1572,36 +1461,30 @@ class ReplayGainPlugin(BeetsPlugin):
         """Return the "replaygain" ui subcommand.
         """
         def func(lib, opts, args):
-            try:
-                write = ui.should_write(opts.write)
-                force = opts.force
+            with self.parallel():
+                try:
+                    write = ui.should_write(opts.write)
+                    force = opts.force
 
-                # Bypass self.open_pool() if called with  `--threads 0`
-                if opts.threads != 0:
-                    threads = opts.threads or self.config['threads'].get(int)
-                    self.open_pool(threads)
-
-                if opts.album:
-                    albums = lib.albums(ui.decargs(args))
-                    self._log.info(
-                        "Analyzing {} albums ~ {} backend..."
-                        .format(len(albums), self.backend_name)
-                    )
-                    for album in albums:
-                        self.handle_album(album, write, force)
-                else:
-                    items = lib.items(ui.decargs(args))
-                    self._log.info(
-                        "Analyzing {} tracks ~ {} backend..."
-                        .format(len(items), self.backend_name)
-                    )
-                    for item in items:
-                        self.handle_track(item, write, force)
-
-                self.close_pool()
-            except (SystemExit, KeyboardInterrupt):
-                # Silence interrupt exceptions
-                pass
+                    if opts.album:
+                        albums = lib.albums(ui.decargs(args))
+                        self._log.info(
+                            "Analyzing {} albums ~ {} backend..."
+                            .format(len(albums), self.backend_name)
+                        )
+                        for album in albums:
+                            self.handle_album(album, write, force)
+                    else:
+                        items = lib.items(ui.decargs(args))
+                        self._log.info(
+                            "Analyzing {} tracks ~ {} backend..."
+                            .format(len(items), self.backend_name)
+                        )
+                        for item in items:
+                            self.handle_track(item, write, force)
+                except (SystemExit, KeyboardInterrupt):
+                    # Silence interrupt exceptions
+                    pass
 
         cmd = ui.Subcommand('replaygain', help=u'analyze for ReplayGain')
         cmd.parser.add_album_option()

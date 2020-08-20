@@ -21,12 +21,20 @@ import traceback
 import re
 import inspect
 import abc
+import sys
 from collections import defaultdict
 from functools import wraps
+from contextlib import contextmanager
 
+from multiprocessing.pool import ThreadPool, RUN
+from threading import Thread, Event
+import signal
+from six.moves import queue
+import time
 
 import beets
 from beets import logging
+from beets.util import cpu_count
 import mediafile
 import six
 
@@ -765,3 +773,146 @@ class MetadataSourcePlugin(object):
         return get_distance(
             data_source=self.data_source, info=track_info, config=self.config
         )
+
+
+class ExceptionWatcher(Thread):
+    """Monitors a queue for exceptions asynchronously.
+        Once an exception occurs, raise it and execute a callback.
+    """
+
+    def __init__(self, queue, callback):
+        self._queue = queue
+        self._callback = callback
+        self._stopevent = Event()
+        Thread.__init__(self)
+
+    def run(self):
+        while not self._stopevent.is_set():
+            try:
+                exc = self._queue.get_nowait()
+                self._callback()
+                six.reraise(exc[0], exc[1], exc[2])
+            except queue.Empty:
+                # No exceptions yet, loop back to check
+                #  whether `_stopevent` is set
+                pass
+
+    def join(self, timeout=None):
+        self._stopevent.set()
+        Thread.join(self, timeout)
+
+
+@six.add_metaclass(abc.ABCMeta)
+class ParallelPlugin(object):
+    threads = cpu_count()
+
+    _pool = None
+    _users = []
+    _tasks = {}
+
+    def __init__(self):
+        super(ParallelPlugin, self).__init__()
+
+        # Not great: outside of plugin scope, will repeat for every child class
+        threads = self.config.parent['parallel_threads'].get()
+
+        if threads is not None:
+            self.threads = threads
+
+        if not hasattr(self, 'nonfatal'):
+            self.nonfatal = []
+
+    def do_parallel(self):
+        return True
+
+    def _has_pool(self):
+        if self._pool is not None:
+            return isinstance(self._pool, ThreadPool)
+        else:
+            return False
+
+    def _register(self):
+        self._users.append(self)
+        self._users = list(set(self._users))
+
+        if self not in self._tasks:
+            self._tasks[self] = []
+
+    def _unregister(self):
+        self._users.remove(self)
+
+    def _open_pool(self):
+        self._register()
+        if self.do_parallel() and self.threads != 0:
+            if not self._has_pool():
+                self._pool = ThreadPool(self.threads)
+                self._exc_queue = queue.Queue()
+
+                signal.signal(signal.SIGINT, self._interrupt)
+
+                self._exc_watcher = ExceptionWatcher(
+                    self._exc_queue, self._close_pool
+                )
+                self._exc_watcher.start()
+
+    def _close_pool(self):
+        self._unregister()
+        if self._has_pool() and len(self._users) == 0:
+            self._pool.close()
+            self._pool.join()
+            self._exc_watcher.join()
+
+    def _terminate_pool(self):
+        if self._has_pool():
+            self._pool.terminate()
+            self._pool.join()
+            self._exc_watcher.join()
+
+    def _interrupt(self, signal, frame):
+        try:
+            self._log.info('interrupted')
+            self._terminate_pool()
+            exit(0)  # shouldn't be necessary
+        except SystemExit:
+            # Silence SystemExit raised by exit(0)
+            pass
+
+    def parallel_on_import(self):
+        self.register_listener('import_begin', self._open_pool)
+        self.register_listener('import', self._close_pool)
+
+    @contextmanager
+    def parallel(self):
+        self._open_pool()
+        try:
+            yield
+        finally:
+            self._close_pool()  # todo: wait until own tasks are done
+            pass
+
+    def parallel_apply(self, func, args, kwds, callback):
+        if self._has_pool():
+            nonfatal = tuple(self.nonfatal)
+
+            def catch_exc(func, exc_queue, log):
+                """Wrapper to catch raised exceptions in threads
+                """
+                def wfunc(*args, **kwargs):
+                    try:
+                        return func(*args, **kwargs)
+                    except nonfatal as e:
+                        log.info(e.args[0])  # log non-fatal exceptions
+                    except Exception:
+                        exc_queue.put(sys.exc_info())
+                return wfunc
+
+            # Wrap function and callback to catch exceptions
+            func = catch_exc(func, self._exc_queue, self._log)
+            callback = catch_exc(callback, self._exc_queue, self._log)
+
+            self._pool.apply_async(func, args, kwds, callback)
+        else:
+            callback(func(*args, **kwds))
+
+    def parallel_map(self, func, iterable, callback):
+        raise NotImplementedError

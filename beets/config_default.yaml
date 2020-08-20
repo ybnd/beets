@@ -61,6 +61,7 @@ overwrite_null:
 plugins: []
 pluginpath: []
 threaded: yes
+parallel_threads:
 timeout: 5.0
 per_disc_numbering: no
 verbose: 0
