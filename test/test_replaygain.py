@@ -28,8 +28,7 @@ from beets import config
 from beets.util import CommandOutput
 from mediafile import MediaFile
 from beetsplug.replaygain import (FatalGstreamerPluginReplayGainError,
-                                  GStreamerBackend,
-                                  ReplayGainPlugin)
+                                  GStreamerBackend)
 
 
 try:
@@ -79,7 +78,7 @@ def _store_retry_once(self, item):
         item.store()
 
 
-@patch.object(ReplayGainPlugin, '_store', _store_retry_once)
+# @patch.object(ReplayGainPlugin, '_store', _store_retry_once)
 class ReplayGainCliTestBase(TestHelper):
     def setUp(self):
         self.setup_beets()
